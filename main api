@@ -1,0 +1,448 @@
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { sign, verify } from 'hono/utils/jwt';
+
+const app = new Hono();
+
+// Enable CORS
+app.use('*', cors());
+
+// In-memory storage
+interface User {
+  id: string;
+  email: string;
+  password: string;
+  name: string;
+}
+
+interface Project {
+  id: string;
+  name: string;
+  description?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface ProjectMember {
+  id: string;
+  userId: string;
+  projectId: string;
+  role: 'ADMIN' | 'MEMBER';
+  createdAt: Date;
+}
+
+interface Task {
+  id: string;
+  title: string;
+  description?: string;
+  status: 'TODO' | 'IN_PROGRESS' | 'DONE';
+  priority: 'LOW' | 'MEDIUM' | 'HIGH';
+  dueDate?: Date;
+  projectId: string;
+  assignedTo?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const users: Map<string, User> = new Map();
+const projects: Map<string, Project> = new Map();
+const projectMembers: Map<string, ProjectMember> = new Map();
+const tasks: Map<string, Task> = new Map();
+
+const JWT_SECRET = Bun.env.JWT_SECRET || 'your-secret-key-change-in-prod';
+
+function generateId(): string {
+  return Math.random().toString(36).substring(2, 15);
+}
+
+async function hashPassword(password: string): Promise<string> {
+  return await Bun.password.hash(password);
+}
+
+async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  return await Bun.password.verify(password, hash);
+}
+
+// Auth Routes
+app.post('/auth/signup', async (c) => {
+  try {
+    const { email, password, name } = await c.req.json();
+
+    if (users.has(email)) {
+      return c.json({ error: 'User already exists' }, 400);
+    }
+
+    const hashedPassword = await hashPassword(password);
+    const userId = generateId();
+
+    const user: User = {
+      id: userId,
+      email,
+      password: hashedPassword,
+      name,
+    };
+
+    users.set(userId, user);
+
+    const token = await sign({ userId, email }, JWT_SECRET);
+
+    return c.json({
+      token,
+      user: { id: userId, email, name },
+    });
+  } catch (error) {
+    return c.json({ error: 'Signup failed' }, 400);
+  }
+});
+
+app.post('/auth/login', async (c) => {
+  try {
+    const { email, password } = await c.req.json();
+
+    let user: User | undefined;
+    for (const u of users.values()) {
+      if (u.email === email) {
+        user = u;
+        break;
+      }
+    }
+
+    if (!user || !(await verifyPassword(password, user.password))) {
+      return c.json({ error: 'Invalid credentials' }, 401);
+    }
+
+    const token = await sign({ userId: user.id, email: user.email }, JWT_SECRET);
+
+    return c.json({
+      token,
+      user: { id: user.id, email: user.email, name: user.name },
+    });
+  } catch (error) {
+    return c.json({ error: 'Login failed' }, 400);
+  }
+});
+
+// Auth Middleware
+const authMiddleware = async (c: any, next: any) => {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader) {
+    return c.json({ error: 'No token provided' }, 401);
+  }
+
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = await verify(token, JWT_SECRET);
+    c.set('userId', decoded.userId);
+    await next();
+  } catch {
+    return c.json({ error: 'Invalid token' }, 401);
+  }
+};
+
+// Project Routes
+app.post('/projects', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const { name, description } = await c.req.json();
+
+    const projectId = generateId();
+    const now = new Date();
+
+    const project: Project = {
+      id: projectId,
+      name,
+      description,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    projects.set(projectId, project);
+
+    const memberId = generateId();
+    const member: ProjectMember = {
+      id: memberId,
+      userId,
+      projectId,
+      role: 'ADMIN',
+      createdAt: now,
+    };
+
+    projectMembers.set(memberId, member);
+
+    return c.json(project);
+  } catch (error) {
+    return c.json({ error: 'Failed to create project' }, 400);
+  }
+});
+
+app.get('/projects', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+
+    const userProjects: Project[] = [];
+    for (const member of projectMembers.values()) {
+      if (member.userId === userId) {
+        const project = projects.get(member.projectId);
+        if (project) userProjects.push(project);
+      }
+    }
+
+    return c.json(userProjects);
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch projects' }, 400);
+  }
+});
+
+app.get('/projects/:id', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const projectId = c.req.param('id');
+
+    const isMember = Array.from(projectMembers.values()).some(
+      (m) => m.userId === userId && m.projectId === projectId
+    );
+
+    if (!isMember) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const project = projects.get(projectId);
+    if (!project) {
+      return c.json({ error: 'Project not found' }, 404);
+    }
+
+    const members = Array.from(projectMembers.values()).filter(
+      (m) => m.projectId === projectId
+    );
+
+    const projectTasks = Array.from(tasks.values()).filter(
+      (t) => t.projectId === projectId
+    );
+
+    return c.json({
+      ...project,
+      members,
+      tasks: projectTasks,
+    });
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch project' }, 400);
+  }
+});
+
+// Task Routes
+app.post('/projects/:projectId/tasks', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const projectId = c.req.param('projectId');
+    const { title, description, priority, dueDate, assignedTo } = await c.req.json();
+
+    const isMember = Array.from(projectMembers.values()).some(
+      (m) => m.userId === userId && m.projectId === projectId
+    );
+
+    if (!isMember) {
+      return c.json({ error: 'Not a project member' }, 403);
+    }
+
+    const taskId = generateId();
+    const now = new Date();
+
+    const task: Task = {
+      id: taskId,
+      title,
+      description,
+      status: 'TODO',
+      priority: priority || 'MEDIUM',
+      dueDate: dueDate ? new Date(dueDate) : undefined,
+      projectId,
+      assignedTo,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    tasks.set(taskId, task);
+
+    return c.json(task);
+  } catch (error) {
+    return c.json({ error: 'Failed to create task' }, 400);
+  }
+});
+
+app.get('/projects/:projectId/tasks', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const projectId = c.req.param('projectId');
+
+    const isMember = Array.from(projectMembers.values()).some(
+      (m) => m.userId === userId && m.projectId === projectId
+    );
+
+    if (!isMember) {
+      return c.json({ error: 'Not a project member' }, 403);
+    }
+
+    const projectTasks = Array.from(tasks.values())
+      .filter((t) => t.projectId === projectId)
+      .sort((a, b) => (a.dueDate && b.dueDate ? a.dueDate.getTime() - b.dueDate.getTime() : 0));
+
+    return c.json(projectTasks);
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch tasks' }, 400);
+  }
+});
+
+app.patch('/tasks/:id', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const taskId = c.req.param('id');
+    const { status, priority, assignedTo } = await c.req.json();
+
+    const task = tasks.get(taskId);
+    if (!task) {
+      return c.json({ error: 'Task not found' }, 404);
+    }
+
+    const isMember = Array.from(projectMembers.values()).some(
+      (m) => m.userId === userId && m.projectId === task.projectId
+    );
+
+    if (!isMember) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const updated: Task = {
+      ...task,
+      status: status || task.status,
+      priority: priority || task.priority,
+      assignedTo: assignedTo !== undefined ? assignedTo : task.assignedTo,
+      updatedAt: new Date(),
+    };
+
+    tasks.set(taskId, updated);
+
+    return c.json(updated);
+  } catch (error) {
+    return c.json({ error: 'Failed to update task' }, 400);
+  }
+});
+
+app.delete('/tasks/:id', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const taskId = c.req.param('id');
+
+    const task = tasks.get(taskId);
+    if (!task) {
+      return c.json({ error: 'Task not found' }, 404);
+    }
+
+    const isMember = Array.from(projectMembers.values()).some(
+      (m) => m.userId === userId && m.projectId === task.projectId
+    );
+
+    if (!isMember) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    tasks.delete(taskId);
+
+    return c.json({ success: true });
+  } catch (error) {
+    return c.json({ error: 'Failed to delete task' }, 400);
+  }
+});
+
+// Team Management
+app.post('/projects/:projectId/members', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const projectId = c.req.param('projectId');
+    const { userId: newUserId, role } = await c.req.json();
+
+    const requester = Array.from(projectMembers.values()).find(
+      (m) => m.userId === userId && m.projectId === projectId
+    );
+
+    if (requester?.role !== 'ADMIN') {
+      return c.json({ error: 'Only admins can add members' }, 403);
+    }
+
+    const memberId = generateId();
+    const member: ProjectMember = {
+      id: memberId,
+      userId: newUserId,
+      projectId,
+      role: role || 'MEMBER',
+      createdAt: new Date(),
+    };
+
+    projectMembers.set(memberId, member);
+
+    return c.json(member);
+  } catch (error) {
+    return c.json({ error: 'Failed to add member' }, 400);
+  }
+});
+
+app.get('/projects/:projectId/members', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+    const projectId = c.req.param('projectId');
+
+    const isMember = Array.from(projectMembers.values()).some(
+      (m) => m.userId === userId && m.projectId === projectId
+    );
+
+    if (!isMember) {
+      return c.json({ error: 'Not a project member' }, 403);
+    }
+
+    const members = Array.from(projectMembers.values()).filter(
+      (m) => m.projectId === projectId
+    );
+
+    return c.json(members);
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch members' }, 400);
+  }
+});
+
+// Dashboard
+app.get('/dashboard', authMiddleware, async (c) => {
+  try {
+    const userId = c.get('userId');
+
+    const userProjects = Array.from(projectMembers.values())
+      .filter((m) => m.userId === userId)
+      .map((m) => projects.get(m.projectId))
+      .filter(Boolean) as Project[];
+
+    const allTasks = Array.from(tasks.values()).filter((t) =>
+      userProjects.some((p) => p.id === t.projectId)
+    );
+
+    const now = new Date();
+    const overdueTasks = allTasks.filter(
+      (t) => t.dueDate && t.dueDate < now && t.status !== 'DONE'
+    );
+    const inProgressTasks = allTasks.filter((t) => t.status === 'IN_PROGRESS');
+
+    return c.json({
+      projectCount: userProjects.length,
+      taskCount: allTasks.length,
+      overdueTasks: overdueTasks.length,
+      inProgressTasks: inProgressTasks.length,
+      projects: userProjects,
+      tasks: allTasks,
+    });
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch dashboard' }, 400);
+  }
+});
+
+// Health check
+app.get('/health', (c) => {
+  return c.json({ status: 'ok' });
+});
+
+export default app;
