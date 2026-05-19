@@ -1,0 +1,7 @@
+curl -X POST http://localhost:3000/projects \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "My Project",
+    "description": "Project description"
+  }'
