@@ -1,0 +1,2 @@
+All endpoints except /auth/signup and /auth/login require JWT token in Authorization header:
+Authorization: Bearer <token>
