@@ -1,6 +1,7 @@
 {
   "name": "project-task-rbac-app",
   "version": "1.0.0",
+  "type": "module",
   "description": "Project and task management app with authentication, role-based access control, REST APIs, and PostgreSQL.",
   "main": "server/index.js",
   "scripts": {
